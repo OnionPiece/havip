@@ -1,0 +1,3 @@
+etcdctl --cacert /tmp/havipv2-test/etcd-ca/ca.crt --cert /tmp/havipv2-test/etcd-ca/etcd-client.crt --key /tmp/havipv2-test/etcd-ca/etcd-client.key --endpoints https://172.28.1.1:2379,https://172.28.1.2:2379,https://172.28.1.3:2379  endpoint status
+
+etcdctl --cacert /tmp/havipv2-test/etcd-ca/ca.crt --cert /tmp/havipv2-test/etcd-ca/etcd-client.crt --key /tmp/havipv2-test/etcd-ca/etcd-client.key --endpoints https://172.28.1.1:2379,https://172.28.1.2:2379,https://172.28.1.3:2379 get --prefix --keys-only /

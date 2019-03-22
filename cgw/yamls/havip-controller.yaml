@@ -1,0 +1,75 @@
+apiVersion: apps.openshift.io/v1
+kind: DeploymentConfig
+metadata:
+  labels:
+    app: havip-controller
+  name: havip-controller
+  namespace: havip
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10
+  selector:
+    deploymentconfig: havip-controller
+  strategy:
+    activeDeadlineSeconds: 21600
+    resources: {}
+    rollingParams:
+      intervalSeconds: 1
+      maxSurge: 25%
+      maxUnavailable: 25%
+      timeoutSeconds: 600
+      updatePeriodSeconds: 1
+    type: Rolling
+  template:
+    metadata:
+      labels:
+        app: havip-controller
+        deploymentconfig: havip-controller
+      name: havip-controller
+      namespace: havip
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: deploymentconfig
+                  operator: In
+                  values:
+                  - havip-controller
+              topologyKey: kubernetes.io/hostname
+            weight: 100
+      containers:
+      - env:
+        - name: NAMESPACE
+          value: havip
+        - name: HAVIP_BINDS_SVC
+          value: "havip-binds"
+        - name: HAVIP_HOSTS_SVC
+          value: "havip-hosts"
+        - name: HAVIP_PROVIDERS_SVC
+          value: "havip-providers"
+        image: harbor.poc.com/openshift/havip-controller:v3.9.1
+        imagePullPolicy: Always
+        name: havip-controller
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 250m
+            memory: 1Gi
+          requests:
+            cpu: 250m
+            memory: 1Gi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 30
+  test: false
+  triggers:
+  - type: ConfigChange

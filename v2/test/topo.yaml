@@ -1,0 +1,62 @@
+withLocalCache: true
+dockerClientApiVersion: 1.38
+network:
+  name: havipv2-test-net
+  cidr: 172.28.0.0/14
+build:
+  images:
+    - source: /controller
+      name: havipv2-controller
+    - source: /fake_notify_server
+      name: havipv2-fake-notify-server
+    - source: /havip
+      name: havipv2-keepalived
+  extraHosts:
+    github.com: 172.28.0.2
+    dl.google.com: 172.28.0.2
+    raw.githubusercontent.com: 172.28.0.2
+    repo.local.io: 172.28.0.2
+    codeload.github.com: 172.28.0.2
+run:
+  - name: etcd
+    image: quay.io/coreos/etcd:v3.3
+    replicas: 3
+    cmd: ["sh", "-c", "mkdir /etcd-data/$HOSTNAME && etcd --name $HOSTNAME --data-dir=/etcd-data/$HOSTNAME -advertise-client-urls https://`hostname -i`:2379 -initial-advertise-peer-urls https://`hostname -i`:2380 -listen-client-urls https://0.0.0.0:2379 -listen-peer-urls https://0.0.0.0:2380 -initial-cluster-token my-etcd-token -initial-cluster etcd-0=https://172.28.1.1:2380,etcd-1=https://172.28.1.2:2380,etcd-2=https://172.28.1.3:2380 -initial-cluster-state new --ca-file /etcd-ca/ca.crt --cert-file /etcd-ca/etcd-server.crt --key-file /etcd-ca/etcd-server.key --peer-ca-file /etcd-ca/ca.crt --peer-cert-file /etcd-ca/etcd-server.crt --peer-key-file /etcd-ca/etcd-server.key"]
+    mounts:
+      - source: /tmp/havipv2-test/etcd-ca
+        target: /etcd-ca
+      - source: /tmp/havipv2-test/etcd-data
+        target: /etcd-data
+    iprangeStart: 172.28.1.1
+  - name: havipv2-controller
+    image: havipv2-controller
+    replicas: 3
+    env:
+      ETCD_ENDPOINTS: https://172.28.1.1:2379,https://172.28.1.2:2379,https://172.28.1.3:2379
+      ETCD_CA: /etcd-ca/ca.crt
+      ETCD_CERT: /etcd-ca/etcd-client.crt
+      ETCD_KEY: /etcd-ca/etcd-client.key
+    mounts:
+      - source: /tmp/havipv2-test/etcd-ca
+        target: /etcd-ca
+      - source: /tmp/havipv2-test/data
+        target: /var/run/secrets/kubernetes.io/serviceaccount
+    iprangeStart: 172.28.2.1
+  - name: havipv2-keepalived
+    image: havipv2-keepalived
+    replicas: 2
+    env:
+      ETCD_ENDPOINTS: https://172.28.1.1:2379,https://172.28.1.2:2379,https://172.28.1.3:2379
+      ETCD_CA: /etcd-ca/ca.crt
+      ETCD_CERT: /etcd-ca/etcd-client.crt
+      ETCD_KEY: /etcd-ca/etcd-client.key
+    mounts:
+      - source: /tmp/havipv2-test/etcd-ca
+        target: /etcd-ca
+    iprangeStart: 172.28.3.1
+  - name: havipv2-fake-notify-server
+    image: havipv2-fake-notify-server
+    mounts:
+      - source: /tmp/havipv2-test/data
+        target: /data
+    iprangeStart: 172.30.0.1

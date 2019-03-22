@@ -1,0 +1,30 @@
+digraph {
+    svc [shape=box, label="service(exposed by route)"];
+    ctl1 [shape=record, label="<api>apiserver|<wch>watchd"];
+    ctl2 [shape=record, label="<api>apiserver|<wch>watchd"];
+    ctl3 [shape=record, label="<api>apiserver|<wch>watchd"];
+    etcd [shape=box, label="etcd cluster"];
+    k8s [shape=box, label="K8S API"];
+    kp1 [shape=record, label="{{<conf>confd|<ntf>app_notify}|keepalived}"];
+    kp2 [shape=record, label="{{<conf>confd|<ntf>app_notify}|keepalived}"];
+    kp3 [shape=record, label="{{<conf>confd|<ntf>app_notify}|keepalived}"];
+
+    svc -> ctl1:api;
+    svc -> ctl2:api;
+    svc -> ctl3:api;
+    ctl1 -> etcd;
+    ctl2 -> etcd;
+    ctl3 -> etcd;
+    etcd -> kp1:conf;
+    etcd -> kp2:conf;
+    etcd -> kp3:conf;
+    kp1:ntf -> etcd [style=dotted, color=red];
+    kp2:ntf -> etcd [style=dotted, color=red];
+    kp3:ntf -> etcd [style=dotted, color=red];
+    ctl1:api -> k8s [style=dotted, color=blue];
+    ctl1:wch -> k8s [style=dotted, color=blue];
+    ctl2:api -> k8s [style=dotted, color=blue];
+    ctl2:wch -> k8s [style=dotted, color=blue];
+    ctl3:api -> k8s [style=dotted, color=blue];
+    ctl3:wch -> k8s [style=dotted, color=blue];
+}

@@ -1,0 +1,12 @@
+[template]
+prefix = "/havip"
+src = "keepalived.tmpl"
+dest = "/etc/keepalived/keepalived.conf"
+owner = "root"
+mode = "0644"
+keys = [
+    "/virtual_routers",
+    "/node",
+]
+check_cmd = "keepalived -t -f {{.src}}"
+reload_cmd = "/bin/bash /home/app/etc/conf.d/keepalived_reload_cmd.sh"

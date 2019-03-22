@@ -1,0 +1,2 @@
+havip-controller may need kick providers off if havip disappears in hosts,
+but it comes complex what to do with services binding with VIP on that havip.

@@ -1,0 +1,29 @@
+import netaddr
+import netifaces
+import os
+
+{{$node := getenv "HOSTNAME"}}
+def get_node_ip():
+    node_ip = "{{getv (printf "/node/%s/node_ip" $node) ""}}"
+    if node_ip:
+        return node_ip
+    ha_intf = "{{getv "/virtual_routers/default/interface" ""}}"
+    if ha_intf:
+        return [
+            addr for addr in netifaces.ifaddresses(ha_intf)[netifaces.AF_INET]
+            if addr['netmask'] != '255.255.255.255'][0]['addr']
+    else:
+        return netifaces.ifaddresses(netifaces.gateways(
+            )['default'][netifaces.AF_INET][1])[netifaces.AF_INET][0]['addr']
+
+
+def get_tun_mac():
+    if 'tun0' in netifaces.interfaces():
+        return netifaces.ifaddresses('tun0')[netifaces.AF_LINK][0]['addr']
+    else:
+        return 'ff:ff:ff:ff:ff:ff'
+
+
+def log(msg):
+    with open('/proc/1/fd/1', 'w+') as f:
+        f.write("[havip/v2] %s" % msg)

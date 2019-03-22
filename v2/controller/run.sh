@@ -1,0 +1,2 @@
+nohup ./watchd &
+./apiserver

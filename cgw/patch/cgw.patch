@@ -1,0 +1,415 @@
+diff --git a/pkg/network/node/iptables.go b/pkg/network/node/iptables.go
+index b70c9ce..6e64fe8 100644
+--- a/pkg/network/node/iptables.go
++++ b/pkg/network/node/iptables.go
+@@ -173,6 +173,8 @@ func (n *NodeIPTables) getNodeIPTablesChains() []Chain {
+ 	var filterRules [][]string
+ 	for _, cidr := range n.clusterNetworkCIDR {
+ 		if n.masqueradeServices {
++			// NOTE(OnionPiece): support centralized SNAT gateway
++			masqRules = append(masqRules, []string{"-s", cidr, "-m", "comment", "--comment", "let CSNAT ingress traffic from outside pass", "-m", "mark", "--mark", "0x2/0x2", "-j", "ACCEPT"})
+ 			masqRules = append(masqRules, []string{"-s", cidr, "-m", "comment", "--comment", "masquerade pod-to-service and pod-to-external traffic", "-j", "MASQUERADE"})
+ 		} else {
+ 			masqRules = append(masqRules, []string{"-s", cidr, "-m", "comment", "--comment", "masquerade pod-to-external traffic", "-j", "OPENSHIFT-MASQUERADE-2"})
+diff --git a/pkg/network/node/node.go b/pkg/network/node/node.go
+index b1a50ba..649033c 100644
+--- a/pkg/network/node/node.go
++++ b/pkg/network/node/node.go
+@@ -461,6 +461,23 @@ func isServiceChanged(oldsvc, newsvc *kapi.Service) bool {
+ 				return true
+ 			}
+ 		}
++		// NOTE(OnionPiece): Support for centralized SNAT gateway. Device tun0 may change its MAC after origin-node restarted, or VIP migrated.
++		oldTunMac, omOK := oldsvc.ObjectMeta.Annotations["tun_mac"]
++		newTunMac, nmOK := newsvc.ObjectMeta.Annotations["tun_mac"]
++		if (omOK || nmOK) && oldTunMac != newTunMac {
++			return true
++		}
++		// NOTE(OnionPiece): Support for centralized SNAT gateway. Node IP which hosts VIP may change after VIP migrated.
++		oldNodeIP, otOK := oldsvc.ObjectMeta.Annotations["node_ip"]
++		newNodeIP, ntOK := newsvc.ObjectMeta.Annotations["node_ip"]
++		if (otOK || ntOK) && oldNodeIP != newNodeIP {
++			return true
++		}
++		oldStatus, osOK := oldsvc.ObjectMeta.Annotations["cgw_enabled"]
++		newStatus, nsOK := newsvc.ObjectMeta.Annotations["cgw_enabled"]
++		if (osOK || nsOK) && oldStatus != newStatus {
++			return true
++		}
+ 		return false
+ 	}
+ 	return true
+diff --git a/pkg/network/node/ovscontroller.go b/pkg/network/node/ovscontroller.go
+index e11cd82..a57ee25 100644
+--- a/pkg/network/node/ovscontroller.go
++++ b/pkg/network/node/ovscontroller.go
+@@ -18,6 +18,8 @@ import (
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	kapi "k8s.io/kubernetes/pkg/apis/core"
++	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
++	utilexec "k8s.io/utils/exec"
+ )
+ 
+ type ovsController struct {
+@@ -94,8 +96,13 @@ func (oc *ovsController) SetupOVS(clusterNetworkCIDR []string, serviceNetworkCID
+ 	// vxlan0
+ 	for _, clusterCIDR := range clusterNetworkCIDR {
+ 		otx.AddFlow("table=0, priority=200, in_port=1, arp, nw_src=%s, nw_dst=%s, actions=move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],goto_table:10", clusterCIDR, localSubnetCIDR)
+-		otx.AddFlow("table=0, priority=200, in_port=1, ip, nw_src=%s, actions=move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],goto_table:10", clusterCIDR)
+-		otx.AddFlow("table=0, priority=200, in_port=1, ip, nw_dst=%s, actions=move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],goto_table:10", clusterCIDR)
++		// NOTE(OnionPiece): Support for centralized SNAT
++		//   P2P or P2S traffic
++		otx.AddFlow("table=0, priority=200, in_port=1, ip, nw_src=%s, nw_dst=%s, actions=move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],goto_table:10", clusterCIDR, clusterCIDR)
++		//   ingress traffic
++		otx.AddFlow("table=0, priority=190, in_port=1, ip, nw_dst=%s, actions=move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],goto_table:10", clusterCIDR)
++		//   egress traffic
++		otx.AddFlow("table=0, priority=180, in_port=1, ip, nw_src=%s, actions=move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],goto_table:100", clusterCIDR)
+ 	}
+ 	otx.AddFlow("table=0, priority=150, in_port=1, actions=drop")
+ 	// tun0
+@@ -194,10 +201,12 @@ func (oc *ovsController) SetupOVS(clusterNetworkCIDR []string, serviceNetworkCID
+ 	// eg, "table=100, priority=100, reg0=${tenant_id}, ip, actions=set_field:${egress_ip_hex}->pkt_mark,output:2"
+ 	otx.AddFlow("table=100, priority=0, actions=goto_table:101")
+ 
++	// NOTE(OnionPiece): support for centralized SNAT gateway. DNS traffic belongs to infra, no need to put in policy table.
++	otx.AddFlow("table=100, priority=%d,tcp,tcp_dst=53,nw_dst=%s,actions=output:2", networkapi.EgressNetworkPolicyMaxRules+1, oc.localIP)
++	otx.AddFlow("table=100, priority=%d,udp,udp_dst=53,nw_dst=%s,actions=output:2", networkapi.EgressNetworkPolicyMaxRules+1, oc.localIP)
++
+ 	// Table 101: egress network policy dispatch; edited by UpdateEgressNetworkPolicy()
+ 	// eg, "table=101, reg0=${tenant_id}, priority=2, ip, nw_dst=${external_cidr}, actions=drop
+-	otx.AddFlow("table=101, priority=%d,tcp,tcp_dst=53,nw_dst=%s,actions=output:2", networkapi.EgressNetworkPolicyMaxRules+1, oc.localIP)
+-	otx.AddFlow("table=101, priority=%d,udp,udp_dst=53,nw_dst=%s,actions=output:2", networkapi.EgressNetworkPolicyMaxRules+1, oc.localIP)
+ 	otx.AddFlow("table=101, priority=0, actions=output:2")
+ 
+ 	// Table 110: outbound multicast filtering, updated by UpdateLocalMulticastFlows()
+@@ -233,7 +242,7 @@ func (oc *ovsController) ensureOvsPort(hostVeth, sandboxID, podIP string) (int,
+ 	)
+ }
+ 
+-func (oc *ovsController) setupPodFlows(ofport int, podIP net.IP, vnid uint32) error {
++func (oc *ovsController) setupPodFlows(ofport int, podIP net.IP, vnid uint32, cgwID string) error {
+ 	otx := oc.ovs.NewTransaction()
+ 
+ 	ipstr := podIP.String()
+@@ -242,7 +251,12 @@ func (oc *ovsController) setupPodFlows(ofport int, podIP net.IP, vnid uint32) er
+ 
+ 	// ARP/IP traffic from container
+ 	otx.AddFlow("table=20, priority=100, in_port=%d, arp, nw_src=%s, arp_sha=%s, actions=load:%d->NXM_NX_REG0[], goto_table:21", ofport, ipstr, ipmac, vnid)
+-	otx.AddFlow("table=20, priority=100, in_port=%d, ip, nw_src=%s, actions=load:%d->NXM_NX_REG0[], goto_table:21", ofport, ipstr, vnid)
++	// NOTE(OnionPiece): Support for centralized SNAT.
++	if len(cgwID) != 0 {
++		otx.AddFlow("table=20, priority=100, in_port=%d, ip, nw_src=%s, actions=load:%d->NXM_NX_REG0[], load:0x%s->NXM_NX_REG3[], goto_table:21", ofport, ipstr, vnid, cgwID)
++	} else {
++		otx.AddFlow("table=20, priority=100, in_port=%d, ip, nw_src=%s, actions=load:%d->NXM_NX_REG0[], goto_table:21", ofport, ipstr, vnid)
++	}
+ 	if oc.useConnTrack {
+ 		otx.AddFlow("table=25, priority=100, ip, nw_src=%s, actions=load:%d->NXM_NX_REG0[], goto_table:30", ipstr, vnid)
+ 	}
+@@ -267,12 +281,12 @@ func (oc *ovsController) cleanupPodFlows(podIP net.IP) error {
+ 	return otx.EndTransaction()
+ }
+ 
+-func (oc *ovsController) SetUpPod(sandboxID, hostVeth string, podIP net.IP, vnid uint32) (int, error) {
++func (oc *ovsController) SetUpPod(sandboxID, hostVeth string, podIP net.IP, vnid uint32, cgwID string) (int, error) {
+ 	ofport, err := oc.ensureOvsPort(hostVeth, sandboxID, podIP.String())
+ 	if err != nil {
+ 		return -1, err
+ 	}
+-	return ofport, oc.setupPodFlows(ofport, podIP, vnid)
++	return ofport, oc.setupPodFlows(ofport, podIP, vnid, cgwID)
+ }
+ 
+ // Returned list can also be used for port names
+@@ -381,7 +395,7 @@ func (oc *ovsController) UpdatePod(sandboxID string, vnid uint32) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	return oc.setupPodFlows(ofport, podIP, vnid)
++	return oc.setupPodFlows(ofport, podIP, vnid, "")
+ }
+ 
+ func (oc *ovsController) TearDownPod(sandboxID string) error {
+@@ -542,12 +556,52 @@ func (oc *ovsController) AddServiceRules(service *kapi.Service, netID uint32) er
+ 		otx.AddFlow(baseRule + action)
+ 	}
+ 
++	// NOTE(OnionPiece): Support for centralized SNAT gateway. Forward traffic with centralized gateway registry(reg3) set, to centralized SNAT host.
++	if len(service.Spec.ExternalIPs) > 0 && len(service.ObjectMeta.Annotations) >= 3 {
++		if cgwEnabled, ok := service.ObjectMeta.Annotations["cgw_enabled"]; ok && cgwEnabled == "true" {
++			if cSNATGatewayId, ok := service.ObjectMeta.Annotations["tun_id"]; ok {
++				if cSNATTunMAC, ok := service.ObjectMeta.Annotations["tun_mac"]; ok {
++					if cSNATNodeIP, ok := service.ObjectMeta.Annotations["node_ip"]; ok && oc.localIP != cSNATNodeIP {
++						otx.AddFlow("table=100, priority=10, ip, reg3=0x%s, actions=set_field:%s->eth_dst,move:NXM_NX_TUN_ID[0..31]->NXM_NX_REG0[],set_field:%s->tun_dst,output:1", cSNATGatewayId, cSNATTunMAC, cSNATNodeIP)
++						if err := otx.EndTransaction(); err != nil {
++							glog.Errorf("Error adding OVS flows for centralized SNAT for service %v: %v", service, err)
++						}
++					}
++				}
++			}
++		}
++	}
++
+ 	return otx.EndTransaction()
+ }
+ 
+ func (oc *ovsController) DeleteServiceRules(service *kapi.Service) error {
+ 	otx := oc.ovs.NewTransaction()
+ 	otx.DeleteFlows(generateBaseServiceRule(service.Spec.ClusterIP))
++
++	// NOTE(OnionPiece): Support for centralized SNAT gateway.
++	if len(service.Spec.ExternalIPs) > 0 && len(service.ObjectMeta.Annotations) >= 3 {
++		if cgwEnabled, ok := service.ObjectMeta.Annotations["cgw_enabled"]; ok && cgwEnabled == "true" {
++			if cSNATGatewayId, ok := service.ObjectMeta.Annotations["tun_id"]; ok {
++				otx.DeleteFlows("table=100, ip, reg3=0x%s", cSNATGatewayId)
++				if err := otx.EndTransaction(); err != nil {
++					glog.Errorf("Error adding OVS flows for centralized SNAT for service %v: %v", service, err)
++				}
++				// A better place should be found to insert conntrack rules deletion.
++				execer := utilexec.New()
++				vip := service.Spec.ExternalIPs[0]
++				err1 := utilproxy.ExecConntrackTool(execer, "-D", "-d", vip)
++				if err1 != nil {
++					glog.Errorf("Failed to clear conntrack for VIP %s, error: %v", vip, err1)
++				}
++				err2 := utilproxy.ExecConntrackTool(execer, "-D", "-q", vip)
++				if err2 != nil {
++					glog.Errorf("Failed to clear conntrack for VIP %s, error: %v", vip, err2)
++				}
++			}
++		}
++	}
++
+ 	return otx.EndTransaction()
+ }
+ 
+diff --git a/pkg/network/node/pod.go b/pkg/network/node/pod.go
+index fd791ab..c7b5b65 100644
+--- a/pkg/network/node/pod.go
++++ b/pkg/network/node/pod.go
+@@ -541,10 +541,16 @@ func (m *podManager) setup(req *cniserver.PodRequest) (cnitypes.Result, *running
+ 		return nil, nil, err
+ 	}
+ 
+-	ofport, err := m.ovs.SetUpPod(req.SandboxID, req.HostVeth, podIP, vnid)
++	// NOTE(OnionPiece): Support for centralized SNAT
++	cgwID := ""
++	if tunID, ok := pod.Annotations["tun_id"]; ok {
++		cgwID = tunID
++	}
++	ofport, err := m.ovs.SetUpPod(req.SandboxID, req.HostVeth, podIP, vnid, cgwID)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
++
+ 	if err := setupPodBandwidth(m.ovs, pod, req.HostVeth, req.SandboxID); err != nil {
+ 		return nil, nil, err
+ 	}
+diff --git a/vendor/k8s.io/kubernetes/pkg/proxy/iptables/proxier.go b/vendor/k8s.io/kubernetes/pkg/proxy/iptables/proxier.go
+index a0d7535..25c82d6 100644
+--- a/vendor/k8s.io/kubernetes/pkg/proxy/iptables/proxier.go
++++ b/vendor/k8s.io/kubernetes/pkg/proxy/iptables/proxier.go
+@@ -81,6 +81,12 @@ const (
+ 	// the mark-for-masquerade chain
+ 	KubeMarkMasqChain utiliptables.Chain = "KUBE-MARK-MASQ"
+ 
++	// NOTE(OnionPiece): the mark for centralized SNAT gateway ingress traffic chain
++	KubeCSNATPostMarkInChain utiliptables.Chain = "KUBE-MARK-CSNAT-INGRESS"
++
++	// NOTE(OnionPiece): the mark for centralized SNAT gateway ingress traffic chain
++	KubeCSNATPostMarkOutChain utiliptables.Chain = "KUBE-MARK-CSNAT-INGRESS2"
++
+ 	// the mark-for-drop chain
+ 	KubeMarkDropChain utiliptables.Chain = "KUBE-MARK-DROP"
+ 
+@@ -160,6 +166,9 @@ type serviceInfo struct {
+ 	servicePortChainName     utiliptables.Chain
+ 	serviceFirewallChainName utiliptables.Chain
+ 	serviceLBChainName       utiliptables.Chain
++	// NOTE(OnionPiece): support for CSNAT gateway
++	enableCSNAT        bool
++	cSNATGatewayNodeIP net.IP
+ }
+ 
+ // internal struct for endpoints information
+@@ -203,6 +212,17 @@ func newServiceInfo(svcPortName proxy.ServicePortName, port *api.ServicePort, se
+ 		// Kube-apiserver side guarantees SessionAffinityConfig won't be nil when session affinity type is ClientIP
+ 		stickyMaxAgeSeconds = int(*service.Spec.SessionAffinityConfig.ClientIP.TimeoutSeconds)
+ 	}
++	// NOTE(OnionPiece): support for CSNAT gateway
++	enableCSNAT := false
++	cSNATGatewayNodeIP := ""
++	if len(service.ObjectMeta.Annotations) != 0 {
++		if cgwEnabled, ok := service.ObjectMeta.Annotations["cgw_enabled"]; ok && cgwEnabled == "true" {
++			enableCSNAT = true
++		}
++		if _, ok := service.ObjectMeta.Annotations["node_ip"]; ok {
++			cSNATGatewayNodeIP = service.ObjectMeta.Annotations["node_ip"]
++		}
++	}
+ 	info := &serviceInfo{
+ 		clusterIP: net.ParseIP(service.Spec.ClusterIP),
+ 		port:      int(port.Port),
+@@ -215,6 +235,9 @@ func newServiceInfo(svcPortName proxy.ServicePortName, port *api.ServicePort, se
+ 		externalIPs:              make([]string, len(service.Spec.ExternalIPs)),
+ 		loadBalancerSourceRanges: make([]string, len(service.Spec.LoadBalancerSourceRanges)),
+ 		onlyNodeLocalEndpoints:   onlyNodeLocalEndpoints,
++		// NOTE(OnionPiece): support for CSNAT gateway
++		enableCSNAT:        enableCSNAT,
++		cSNATGatewayNodeIP: net.ParseIP(cSNATGatewayNodeIP),
+ 	}
+ 
+ 	copy(info.loadBalancerSourceRanges, service.Spec.LoadBalancerSourceRanges)
+@@ -555,7 +578,7 @@ func CleanupLeftovers(ipt utiliptables.Interface) (encounteredError bool) {
+ 		natRules := bytes.NewBuffer(nil)
+ 		writeLine(natChains, "*nat")
+ 		// Start with chains we know we need to remove.
+-		for _, chain := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, KubeMarkMasqChain} {
++		for _, chain := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, KubeMarkMasqChain, KubeCSNATPostMarkInChain, KubeCSNATPostMarkOutChain} {
+ 			if _, found := existingNATChains[chain]; found {
+ 				chainString := string(chain)
+ 				writeLine(natChains, existingNATChains[chain]) // flush
+@@ -1058,7 +1081,7 @@ func (proxier *Proxier) syncProxyRules() {
+ 			writeLine(proxier.filterChains, utiliptables.MakeChainLine(chainName))
+ 		}
+ 	}
+-	for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, KubeMarkMasqChain} {
++	for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, KubeMarkMasqChain, KubeCSNATPostMarkInChain, KubeCSNATPostMarkOutChain} {
+ 		if chain, ok := existingNATChains[chainName]; ok {
+ 			writeLine(proxier.natChains, chain)
+ 		} else {
+@@ -1066,6 +1089,26 @@ func (proxier *Proxier) syncProxyRules() {
+ 		}
+ 	}
+ 
++	// NOTE(OnionPiece): Support CSNAT gateway.
++	if _, err := proxier.iptables.EnsureChain(utiliptables.TableNAT, KubeCSNATPostMarkOutChain); err != nil {
++		glog.Errorf("Failed to ensure that %s chain %s exists: %v", utiliptables.TableNAT, KubeCSNATPostMarkOutChain, err)
++		return
++	}
++	csnatArgs := []string{
++		"-m", "comment", "--comment", "goto check if CSNAT is enabled for specified source IP",
++		"-j", string(KubeCSNATPostMarkOutChain),
++	}
++	if _, err := proxier.iptables.EnsureRule(utiliptables.Prepend, utiliptables.TableNAT, utiliptables.ChainPostrouting, csnatArgs...); err != nil {
++		glog.Errorf("Failed to ensure that %s chain %s jumps to %s: %v", string(utiliptables.TableNAT), string(utiliptables.ChainPostrouting), string(KubeCSNATPostMarkOutChain), err)
++		return
++	}
++	writeLine(proxier.natRules, []string{
++		"-A", string(kubePostroutingChain),
++		"-m", "comment", "--comment", `"no MASQ needed for ingress traffic via centralized SNAT from outside does"`,
++		"-m", "mark", "--mark", "0x2/0x2",
++		"-j", "ACCEPT",
++	}...)
++
+ 	// Install the kubernetes-specific postrouting rules. We use a whole chain for
+ 	// this so that it is easier to flush and change, for example if the mark
+ 	// value should ever change.
+@@ -1076,6 +1119,19 @@ func (proxier *Proxier) syncProxyRules() {
+ 		"-j", "MASQUERADE",
+ 	}...)
+ 
++	// NOTE(OnionPiece): Support CSNAT gateway.
++	writeLine(proxier.natRules, []string{
++		"-A", string(KubeCSNATPostMarkInChain),
++		"!", "-s", proxier.clusterCIDR,
++		"-m", "comment", "--comment", `"mark ingress traffic via centralized SNAT from outside"`,
++		"-j", "MARK", "--set-xmark", "0x2/0x2",
++	}...)
++	writeLine(proxier.natRules, []string{
++		"-A", string(KubeCSNATPostMarkInChain),
++		"-m", "comment", "--comment", `"mark ingress traffic via centralized SNAT from pod"`,
++		"-j", "MARK", "--set-xmark", "0x4/0x4",
++	}...)
++
+ 	// Install the kubernetes-specific masquerade mark rule. We use a whole chain for
+ 	// this so that it is easier to flush and change, for example if the mark
+ 	// value should ever change.
+@@ -1164,6 +1220,9 @@ func (proxier *Proxier) syncProxyRules() {
+ 			)
+ 		}
+ 
++		// NOTE(OnionPiece) Used to install SNAT rules for pods backed to a service with externalIPs
++		installedEgressSNAT := false
++
+ 		// Capture externalIPs.
+ 		for _, externalIP := range svcInfo.externalIPs {
+ 			// If the "external" IP happens to be an IP that is local to this
+@@ -1208,21 +1267,63 @@ func (proxier *Proxier) syncProxyRules() {
+ 					"-d", utilproxy.ToCIDR(net.ParseIP(externalIP)),
+ 					"--dport", strconv.Itoa(svcInfo.port),
+ 				)
+-				// We have to SNAT packets to external IPs.
+-				writeLine(proxier.natRules, append(args, "-j", string(KubeMarkMasqChain))...)
++				// NOTE(OnionPiece): support CSNAT gateway
++				// For services configured with external IPs, but without CSNAT, since
++				// traffic to them will be SNATed distributedly on each node with each
++				// subnet gateway IP, it is easy to throw reponse back to corrent node.
++				//
++				// For services configured with external IPs, with CSNAT, since only the
++				// master node in HA will hold VIP, so only master node has ability to do
++				// SNAT for egress from pod, and do DNAT for ingress for outside or pod.
++				installDNAT := (svcInfo.enableCSNAT && proxier.nodeIP.Equal(svcInfo.cSNATGatewayNodeIP)) || !svcInfo.enableCSNAT
++				if installDNAT {
++					if svcInfo.enableCSNAT {
++						writeLine(proxier.natRules, append(args, "-j", string(KubeCSNATPostMarkInChain))...)
++					}
+ 
+-				// Allow traffic for external IPs that does not come from a bridge (i.e. not from a container)
+-				// nor from a local process to be forwarded to the service.
+-				// This rule roughly translates to "all traffic from off-machine".
+-				// This is imperfect in the face of network plugins that might not use a bridge, but we can revisit that later.
+-				externalTrafficOnlyArgs := append(args,
+-					"-m", "physdev", "!", "--physdev-is-in",
+-					"-m", "addrtype", "!", "--src-type", "LOCAL")
+-				writeLine(proxier.natRules, append(externalTrafficOnlyArgs, "-j", string(svcChain))...)
+-				dstLocalOnlyArgs := append(args, "-m", "addrtype", "--dst-type", "LOCAL")
+-				// Allow traffic bound for external IPs that happen to be recognized as local IPs to stay local.
+-				// This covers cases like GCE load-balancers which get added to the local routing table.
+-				writeLine(proxier.natRules, append(dstLocalOnlyArgs, "-j", string(svcChain))...)
++					// We have to SNAT packets to external IPs.
++					writeLine(proxier.natRules, append(args, "-j", string(KubeMarkMasqChain))...)
++
++					// Allow traffic for external IPs that does not come from a bridge (i.e. not from a container)
++					// nor from a local process to be forwarded to the service.
++					// This rule roughly translates to "all traffic from off-machine".
++					// This is imperfect in the face of network plugins that might not use a bridge, but we can revisit that later.
++					externalTrafficOnlyArgs := append(args,
++						"-m", "physdev", "!", "--physdev-is-in",
++						"-m", "addrtype", "!", "--src-type", "LOCAL")
++					writeLine(proxier.natRules, append(externalTrafficOnlyArgs, "-j", string(svcChain))...)
++					dstLocalOnlyArgs := append(args, "-m", "addrtype", "--dst-type", "LOCAL")
++					// Allow traffic bound for external IPs that happen to be recognized as local IPs to stay local.
++					// This covers cases like GCE load-balancers which get added to the local routing table.
++					writeLine(proxier.natRules, append(dstLocalOnlyArgs, "-j", string(svcChain))...)
++				}
++
++				// NOTE(OnionPiece): Support SNAT gateway. Do SNAT for known pods behind to service with external IP, with CSNAT enabled.
++				if (svcInfo.enableCSNAT && proxier.nodeIP.Equal(svcInfo.cSNATGatewayNodeIP)) && !installedEgressSNAT {
++					if len(proxier.clusterCIDR) > 0 {
++						endpoints := make([]*endpointsInfo, 0)
++						for _, ep := range proxier.endpointsMap[svcName] {
++							endpoints = append(endpoints, ep)
++						}
++						for _, endpoint := range endpoints {
++							writeLine(proxier.natRules,
++								"-A", string(KubeCSNATPostMarkOutChain),
++								"-m", protocol, "-p", protocol,
++								"-s", fmt.Sprintf("%s/32", endpoint.IPPart()),
++								"!", "-d", proxier.clusterCIDR,
++								"-j", "SNAT", "--to-source", externalIP,
++							)
++							writeLine(proxier.natRules,
++								"-A", string(KubeCSNATPostMarkOutChain),
++								"-m", protocol, "-p", protocol,
++								"-m", "mark", "--mark", "0x4/0x4",
++								"-s", fmt.Sprintf("%s/32", endpoint.IPPart()),
++								"-j", "SNAT", "--to-source", externalIP,
++							)
++						}
++						installedEgressSNAT = true
++					}
++				}
+ 			} else {
+ 				writeLine(proxier.filterRules,
+ 					"-A", string(kubeExternalServicesChain),

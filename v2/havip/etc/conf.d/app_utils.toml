@@ -1,0 +1,8 @@
+[template]
+src = "utils.tmpl"
+dest = "/etc/keepalived/app/utils.py"
+prefix = "/havip"
+keys = [
+    "/virtual_routers/default",
+    "/node",
+]

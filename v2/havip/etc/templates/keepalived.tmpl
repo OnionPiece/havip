@@ -1,0 +1,45 @@
+! Configuration File for keepalived
+
+global_defs {
+    enable_script_security
+    script_user root
+}
+
+vrrp_script chk_script {
+    script "/etc/keepalived/app/check.py"
+    interval {{getv "/virtual_routers/default/check_interval"}}
+    timeout {{getv "/virtual_routers/default/check_timeout"}}
+    rise {{getv "/virtual_routers/default/check_rise"}}
+    fall {{getv "/virtual_routers/default/check_fall"}}
+}
+
+{{$node := getenv "HOSTNAME"}}
+{{range split (getv (printf "/node/%s/vrids" $node)) ","}}
+vrrp_instance instance_{{.}} {
+    {{$interface := getv (printf "/virtual_routers/%s/interface" .) (getv "/virtual_routers/default/interface")}}
+    interface {{$interface}}
+    state BACKUP
+    virtual_router_id {{.}}
+    priority 50
+    advert_int {{getv (printf "/virtual_routers/%s/advert_interval" .) (getv "/virtual_routers/default/advert_interval")}}
+    nopreempt
+
+    authentication {
+        auth_type PASS
+        auth_pass Sylvanas
+    }
+
+    track_script {
+        chk_script
+    }
+
+    notify "/etc/keepalived/app/notify.py"
+
+    virtual_ipaddress {
+    {{/*ignore vips missing error when new virtual_router just been inserted and without new vips, which will be fixed in next updating just after vips inserted. */}}
+    {{range split (getv (printf "/virtual_routers/%s/vips" .)) ","}}
+        {{.}} dev {{$interface}}
+    {{end}}
+    }
+}
+{{end}}
